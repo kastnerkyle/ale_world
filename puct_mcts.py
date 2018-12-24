@@ -97,7 +97,7 @@ class MCTS(object):
         node = self.root
         if self.use_ale_clone:
             # clone for planning if state_manager truly stateful (ALE)
-            state_mgr_int = self.state_manager.get_clone()
+            state_mgr_int = self.state_manager.get_ale_clone()
             state_mgr = self.state_manager
         else:
             state_mgr = self.state_manager
@@ -119,8 +119,6 @@ class MCTS(object):
             node.expand(actions_and_probs)
         value = state_mgr.rollout_from_state(state)
         if self.use_ale_clone:
-            if s > 20:
-                from IPython import embed; embed(); raise ValueError()
             self.state_manager.ale.restoreState(state_mgr_int)
         # negative here for multiplayer?
         node.update(value)
