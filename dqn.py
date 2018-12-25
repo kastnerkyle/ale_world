@@ -14,36 +14,51 @@ import torch.optim as optim
 
 
 GRID_SIZE = 10
+# TARGET_UPDATE 0 uses policy network, otherwise use replica target
 TARGET_UPDATE = 10
-EVALUATE_EVERY = 50
-N_EVALUATIONS = 5
+# How often to check and evaluate
+EVALUATE_EVERY = 100
+SAVE_IMAGES = False
+N_EVALUATIONS = 100
 PRINT_EVERY = 1
-N_ENSEMBLE = 5
-PRIOR_SCALE = 10.
+N_ENSEMBLE = 1
+PRIOR_SCALE = 0.
 N_EPOCHS = 1000
 BATCH_SIZE = 128
-EPSILON = .0
+EPSILON = .4
 GAMMA = .8
-CLIP_GRAD = 10
-ADAM_LEARNING_RATE = 1E-4
+CLIP_GRAD = 1
+ADAM_LEARNING_RATE = 1E-3
 
 random_state = np.random.RandomState(11)
 
-def save_img():
-    if 'images' not in os.listdir('.'):
-        os.mkdir('images')
+def seed_everything(seed=1234):
+    #random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    #torch.backends.cudnn.deterministic = True
+
+seed_everything(22)
+
+def save_img(epoch):
+    if 'images_{}'.format(epoch) not in os.listdir('.'):
+        os.mkdir('images_{}'.format(epoch))
     frame = 0
     while True:
-        screen = (yield)
+        screen, reward = (yield)
         plt.imshow(screen[0], interpolation='none')
-        plt.savefig('images/%03i.png' % frame)
+        plt.title("reward: {}".format(reward))
+        plt.savefig('images_{}/{}.png'.format(epoch, frame))
         frame += 1
 
 def episode():
     """
     Coroutine of episode.
 
-    Action has to be explicitly send to this coroutine.
+    Action has to be explicitly sent to this coroutine.
+    actions are 0, 1, 2 for left, don't-move, and right
     """
     x, y, z = (
         random_state.randint(0, GRID_SIZE),  # X of fruit
@@ -60,18 +75,31 @@ def episode():
         # End of game is known when fruit is at penultimate line of grid.
         # End represents either a win or a loss
         end = int(y >= GRID_SIZE - 2)
-        if end and x not in bar:
-            end *= -1
 
-        action = yield X[np.newaxis], end
+        reward = 0
+        # can add this for dense rewards
+        #if x in bar:
+        #   reward = 1
+        if end and x not in bar:
+           reward = -1
+        if end and x in bar:
+           reward = 1
+
+        action = yield X[None], reward #end
         if end:
             break
+
+        # translate actions
+        # 0 is left
+        # 1 is same (0)
+        # 2 is right
+        action = action - 1
 
         z = min(max(z + action, 1), GRID_SIZE - 2)
         y += 1
 
 
-def experience_replay(batch_size, max_size=10000):
+def experience_replay(batch_size, max_size=1000):
     """
     Coroutine of experience replay.
 
@@ -82,7 +110,7 @@ def experience_replay(batch_size, max_size=10000):
     while True:
         inds = np.arange(len(memory))
         experience = yield [memory[i] for i in random_state.choice(inds, size=batch_size, replace=True)] if batch_size <= len(memory) else None
-        # send None to just get random experiences
+        # send None to just get random experiences, without changing buffer
         if experience is not None:
             memory.append(experience)
             if len(memory) > max_size:
@@ -94,12 +122,12 @@ class CoreNet(nn.Module):
         super(CoreNet, self).__init__()
         self.conv1 = nn.Conv2d(1, 16, 3, 1, padding=(1, 1))
         self.conv2 = nn.Conv2d(16, 16, 3, 1, padding=(1, 1))
-        self.conv3 = nn.Conv2d(16, 16, 3, 1, padding=(1, 1))
+        #self.conv3 = nn.Conv2d(16, 16, 3, 1, padding=(1, 1))
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
+        #x = F.relu(self.conv3(x))
         x = x.view(-1, 10 * 10 * 16)
         return x
 
@@ -107,8 +135,8 @@ class CoreNet(nn.Module):
 class HeadNet(nn.Module):
     def __init__(self):
         super(HeadNet, self).__init__()
-        self.fc1 = nn.Linear(10 * 10 * 16, 512)
-        self.fc2 = nn.Linear(512, 3)
+        self.fc1 = nn.Linear(10 * 10 * 16, 100)
+        self.fc2 = nn.Linear(100, 3)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -121,7 +149,6 @@ class EnsembleNet(nn.Module):
         super(EnsembleNet, self).__init__()
         self.core_net = CoreNet()
         self.net_list = nn.ModuleList([HeadNet() for k in range(n_ensemble)])
-
     def forward(self, x):
         return [net(self.core_net(x)) for net in self.net_list]
 
@@ -130,31 +157,76 @@ class NetWithPrior(nn.Module):
     def __init__(self, net, prior, prior_scale=1.):
         super(NetWithPrior, self).__init__()
         self.net = net
-        self.prior = prior
         self.prior_scale = prior_scale
+        if self.prior_scale > 0.:
+            self.prior = prior
 
     def forward(self, x):
         if hasattr(self.net, "net_list"):
-            return [self.net(x)[k] + self.prior_scale * self.prior(x)[k].detach() for k in range(len(self.net.net_list))]
-        else:
-            return self.net(x) + self.prior_scale * self.prior(x).detach()
+            if self.prior_scale > 0.:
+                return [self.net(x)[k] + self.prior_scale * self.prior(x)[k].detach() for k in range(len(self.net.net_list))]
+            else:
+                return [self.net(x)[k] for k in range(len(self.net.net_list))]
 
-# Recipe of deep reinforcement learning model
+        else:
+            if self.prior_scale > 0.:
+                return self.net(x) + self.prior_scale * self.prior(x).detach()
+            else:
+                return self.net(x)
+
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 16, 3, 1, padding=(1, 1))
+        self.conv2 = nn.Conv2d(16, 16, 3, 1, padding=(1, 1))
+        #self.conv3 = nn.Conv2d(16, 16, 3, 1, padding=(1, 1))
+        self.fc1 = nn.Linear(10 * 10 * 16, 100)
+        self.fc2 = nn.Linear(100, 3)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        #x = F.relu(self.conv3(x))
+        x = x.view(-1, 10 * 10 * 16)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return [x]
+
+"""
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.fc1 = nn.Linear(10 * 10, 3)
+
+    def forward(self, x):
+        x = x.view(-1, 10 * 10)
+        x = self.fc1(x)
+        return [x]
+"""
+
+
+"""
 prior_net = EnsembleNet(N_ENSEMBLE)
 policy_net = EnsembleNet(N_ENSEMBLE)
 policy_net = NetWithPrior(policy_net, prior_net, PRIOR_SCALE)
 
-opt = optim.Adam(policy_net.parameters(), lr=ADAM_LEARNING_RATE)
-
 target_net = EnsembleNet(N_ENSEMBLE)
 target_net = NetWithPrior(target_net, prior_net, PRIOR_SCALE)
+"""
+policy_net = Net()
+target_net = Net()
+
+#opt = optim.RMSprop(policy_net.parameters(), lr=ADAM_LEARNING_RATE, alpha=.9, eps=1E-6)
+opt = optim.Adam(policy_net.parameters(), lr=ADAM_LEARNING_RATE)
+
 
 exp_replays = [experience_replay(BATCH_SIZE) for k in range(N_ENSEMBLE)]
-[e.next() for e in exp_replays] # Start experience-replay coroutines
+[next(e) for e in exp_replays] # Start experience-replay coroutines
 
 for i in range(N_EPOCHS):
     ep = episode()
-    S, won = ep.next()  # Start coroutine of single entire episode
+    S, won = next(ep)  # Start coroutine of single episode
     epoch_losses = [0. for k in range(N_ENSEMBLE)]
     epoch_steps = [1. for k in range(N_ENSEMBLE)]
     heads = list(range(N_ENSEMBLE))
@@ -164,11 +236,12 @@ for i in range(N_EPOCHS):
         policy_net.train()
         while True:
             if random_state.rand() < EPSILON:
-                action = random_state.randint(-1, 2)
+                action = random_state.randint(0, 3)
             else:
                 # Get the index of the maximum q-value of the model.
                 # Subtract one because actions are either -1, 0, or 1
-                action = np.argmax(policy_net(torch.Tensor(S[None]))[active_head].data.numpy(), axis=-1)[0] - 1
+                with torch.no_grad():
+                    action = np.argmax(policy_net(torch.Tensor(S[None]))[active_head].detach().data.numpy(), axis=-1)[0]
 
             S_prime, won = ep.send(action)
             ongoing_flag = 1.
@@ -178,11 +251,11 @@ for i in range(N_EPOCHS):
                 exp_replay = exp_replays[k]
                 # reset batch to default None, since we are looping
                 batch = None
-                # .5 probability of adding to each buffer, see paper for details
-                if random_state.rand() < .5:
-                    continue
-                else:
+                # .5 probability of adding to each buffer for bootstrap dqn, see paper for details
+                if random_state.rand() > .5 or N_ENSEMBLE == 1:
                     batch = exp_replay.send(experience)
+                else:
+                    continue
                 if batch:
                     inputs = []
                     actions = []
@@ -195,27 +268,37 @@ for i in range(N_EPOCHS):
                         actions.append(a)
                         nexts.append(s_prime)
                         ongoing_flags.append(ongoing_flag)
-                    Qs = policy_net(torch.Tensor(inputs))[k]
-                    Qs = Qs.gather(1, torch.LongTensor(np.array(actions)[:, None].astype("int32") + 1))
 
-                    next_Qs = target_net(torch.Tensor(nexts))[k].detach()
+                    if TARGET_UPDATE == 0:
+                        next_Qs = policy_net(torch.Tensor(nexts))[k].detach()
+                    else:
+                        next_Qs = target_net(torch.Tensor(nexts))[k].detach()
                     # standard Q
-                    #next_max_Qs = next_Qs.max(1)[0]
+                    next_max_Qs = next_Qs.max(1)[0]
 
                     # double Q
-                    policy_next_Qs = policy_net(torch.Tensor(nexts))[k].detach()
-                    policy_actions = policy_next_Qs.max(1)[1][:, None]
-                    next_max_Qs = next_Qs.gather(1, policy_actions)
+                    #policy_next_Qs = policy_net(torch.Tensor(nexts))[k].detach()
+                    #policy_actions = policy_next_Qs.max(1)[1][:, None]
+                    #next_max_Qs = next_Qs.gather(1, policy_actions)
                     # mask based on if it is end of episode or not
                     next_max_Qs = torch.Tensor(ongoing_flags) * next_max_Qs
                     target_Qs = torch.Tensor(np.array(rewards).astype("float32")) + GAMMA * next_max_Qs
 
-                    loss = torch.mean((Qs - target_Qs) ** 2)
+                    # get current step predictions
+                    Qs = policy_net(torch.Tensor(inputs))[k]
+                    Qs = Qs.gather(1, torch.LongTensor(np.array(actions)[:, None].astype("int32")))
+
+                    # BROADCASTING! NEED TO MAKE SURE DIMS MATCH
+                    loss = torch.mean((Qs - target_Qs[:, None]) ** 2)
+                    #loss = F.smooth_l1_loss(Qs, target_Qs[:, None])
+
                     opt.zero_grad()
                     loss.backward()
+                    for param in policy_net.parameters():
+                        param.grad.data.clamp_(-CLIP_GRAD, CLIP_GRAD)
                     #print("policy", sum([p.abs().sum().data.numpy() for p in policy_net.parameters()]))
                     #print("target", sum([p.abs().sum().data.numpy() for p in target_net.parameters()]))
-                    torch.nn.utils.clip_grad_value_(policy_net.parameters(), CLIP_GRAD)
+                    #torch.nn.utils.clip_grad_value_(policy_net.parameters(), CLIP_GRAD)
                     opt.step()
                     epoch_losses[k] += loss.detach().cpu().numpy()
                     epoch_steps[k] += 1.
@@ -226,32 +309,44 @@ for i in range(N_EPOCHS):
         experience = (S, action, won, S, ongoing_flag)
         exp_replay.send(experience)
 
-    if i % TARGET_UPDATE == 0:
+    if TARGET_UPDATE > 0 and i % TARGET_UPDATE == 0:
         print("Updating target network at {}".format(i))
         target_net.load_state_dict(policy_net.state_dict())
 
     if i % PRINT_EVERY == 0:
-        print("Epoch {}, head {}, loss: {}".format(i + 1, active_head, [epoch_losses[k] / float(epoch_steps[k]) for k in range(N_ENSEMBLE)]))
+        #print("Epoch {}, head {}, loss: {}".format(i + 1, active_head, [epoch_losses[k] / float(epoch_steps[k]) for k in range(N_ENSEMBLE)]))
+        print("Epoch {}, head {}, loss: {}".format(i + 1, active_head, [epoch_losses[k] for k in range(N_ENSEMBLE)]))
 
     if i % EVALUATE_EVERY == 0 or i == (N_EPOCHS - 1):
-        #img_saver = save_img()
-        #img_saver.next()
+        if i == (N_EPOCHS - 1):
+            # save images at the end for sure
+            SAVE_IMAGES = True
+            N_EVALUATIONS = 5
+        if SAVE_IMAGES:
+            img_saver = save_img(i)
+            next(img_saver)
         ensemble_rewards = []
         for k in range(N_ENSEMBLE):
             avg_rewards = []
             for _ in range(N_EVALUATIONS):
+                print("Evaluation {}".format(_))
                 g = episode()
-                S, won = g.next()
-                #img_saver.send(S)
-                episode_rewards = [won]
+                S, reward = next(g)
+                if SAVE_IMAGES:
+                    img_saver.send((S, reward))
+                episode_rewards = [reward]
                 try:
                     policy_net.eval()
                     while True:
-                        act = np.argmax(policy_net(torch.Tensor(S[np.newaxis]))[k].data.numpy(), axis=-1)[0] - 1
-                        S, won = g.send(act)
-                        episode_rewards.append(won)
-                        #img_saver.send(S)
+                        act = np.argmax(policy_net(torch.Tensor(S[None]))[k].data.numpy(), axis=-1)[0]
+                        S, reward = g.send(act)
+                        episode_rewards.append(reward)
+                        if SAVE_IMAGES:
+                            img_saver.send((S, reward))
                 except StopIteration:
+                    # sum should be either -1 or +1
                     avg_rewards.append(np.sum(episode_rewards))
             ensemble_rewards.append(np.mean(avg_rewards))
         print("rewards", ensemble_rewards)
+        if SAVE_IMAGES:
+            img_saver.close()
