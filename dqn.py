@@ -6,6 +6,7 @@ import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib import pyplot as plt
 import copy
+import time
 
 import torch
 import torch.nn as nn
@@ -13,21 +14,40 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 
+# Size of game grid e.g. 10 -> 10x10
 GRID_SIZE = 10
+# How often to check and evaluate
+EVALUATE_EVERY = 10
+# Save images of policy at each evaluation if True, otherwise only at the end if False
+SAVE_IMAGES = False
+# How often to print statistics
+PRINT_EVERY = 1
+
+# Whether to use double DQN or regular DQN
+USE_DOUBLE_DQN = True
 # TARGET_UPDATE 0 uses policy network, otherwise use replica target
 TARGET_UPDATE = 10
-# How often to check and evaluate
-EVALUATE_EVERY = 100
-SAVE_IMAGES = False
+# Number of evaluation episodes to run
 N_EVALUATIONS = 100
-PRINT_EVERY = 1
-N_ENSEMBLE = 1
-PRIOR_SCALE = 0.
-N_EPOCHS = 1000
+# Number of heads for ensemble (1 falls back to DQN)
+N_ENSEMBLE = 3
+# Probability of experience to go to each head
+BERNOULLI_P = .5
+# Weight for randomized prior, 0. disables
+PRIOR_SCALE = 1.
+# Number of episodes to run
+N_EPOCHS = 20
+# Batch size to use for learning
 BATCH_SIZE = 128
-EPSILON = .4
+# Buffer size for experience replay
+BUFFER_SIZE = 1000
+# Epsilon greedy exploration ~prob of random action, 0. disables
+EPSILON = .0
+# Gamma weight in Q update
 GAMMA = .8
+# Gradient clipping setting
 CLIP_GRAD = 1
+# Learning rate for Adam
 ADAM_LEARNING_RATE = 1E-3
 
 random_state = np.random.RandomState(11)
@@ -99,7 +119,7 @@ def episode():
         y += 1
 
 
-def experience_replay(batch_size, max_size=1000):
+def experience_replay(batch_size, max_size):
     """
     Coroutine of experience replay.
 
@@ -193,38 +213,25 @@ class Net(nn.Module):
         x = self.fc2(x)
         return [x]
 
-"""
-class Net(nn.Module):
-    def __init__(self):
-        super(Net, self).__init__()
-        self.fc1 = nn.Linear(10 * 10, 3)
 
-    def forward(self, x):
-        x = x.view(-1, 10 * 10)
-        x = self.fc1(x)
-        return [x]
-"""
-
-
-"""
 prior_net = EnsembleNet(N_ENSEMBLE)
 policy_net = EnsembleNet(N_ENSEMBLE)
 policy_net = NetWithPrior(policy_net, prior_net, PRIOR_SCALE)
 
 target_net = EnsembleNet(N_ENSEMBLE)
 target_net = NetWithPrior(target_net, prior_net, PRIOR_SCALE)
-"""
-policy_net = Net()
-target_net = Net()
 
-#opt = optim.RMSprop(policy_net.parameters(), lr=ADAM_LEARNING_RATE, alpha=.9, eps=1E-6)
 opt = optim.Adam(policy_net.parameters(), lr=ADAM_LEARNING_RATE)
 
-
-exp_replays = [experience_replay(BATCH_SIZE) for k in range(N_ENSEMBLE)]
+# change minibatch setup to use masking...
+exp_replays = [experience_replay(BATCH_SIZE, BUFFER_SIZE) for k in range(N_ENSEMBLE)]
 [next(e) for e in exp_replays] # Start experience-replay coroutines
 
+# Stores the total rewards from each evaluation, per head over all epochs
+accumulated_rewards = []
+overall_time = 0.
 for i in range(N_EPOCHS):
+    start = time.time()
     ep = episode()
     S, won = next(ep)  # Start coroutine of single episode
     epoch_losses = [0. for k in range(N_ENSEMBLE)]
@@ -273,13 +280,18 @@ for i in range(N_EPOCHS):
                         next_Qs = policy_net(torch.Tensor(nexts))[k].detach()
                     else:
                         next_Qs = target_net(torch.Tensor(nexts))[k].detach()
-                    # standard Q
-                    next_max_Qs = next_Qs.max(1)[0]
 
-                    # double Q
-                    #policy_next_Qs = policy_net(torch.Tensor(nexts))[k].detach()
-                    #policy_actions = policy_next_Qs.max(1)[1][:, None]
-                    #next_max_Qs = next_Qs.gather(1, policy_actions)
+                    if USE_DOUBLE_DQN:
+                        # double Q
+                        policy_next_Qs = policy_net(torch.Tensor(nexts))[k].detach()
+                        policy_actions = policy_next_Qs.max(1)[1][:, None]
+                        next_max_Qs = next_Qs.gather(1, policy_actions)
+                        next_max_Qs = next_max_Qs.squeeze()
+                    else:
+                        # standard Q
+                        next_max_Qs = next_Qs.max(1)[0]
+                        next_max_Qs = next_max_Qs.squeeze()
+
                     # mask based on if it is end of episode or not
                     next_max_Qs = torch.Tensor(ongoing_flags) * next_max_Qs
                     target_Qs = torch.Tensor(np.array(rewards).astype("float32")) + GAMMA * next_max_Qs
@@ -287,18 +299,15 @@ for i in range(N_EPOCHS):
                     # get current step predictions
                     Qs = policy_net(torch.Tensor(inputs))[k]
                     Qs = Qs.gather(1, torch.LongTensor(np.array(actions)[:, None].astype("int32")))
+                    Qs = Qs.squeeze()
 
                     # BROADCASTING! NEED TO MAKE SURE DIMS MATCH
-                    loss = torch.mean((Qs - target_Qs[:, None]) ** 2)
+                    loss = torch.mean((Qs - target_Qs) ** 2)
                     #loss = F.smooth_l1_loss(Qs, target_Qs[:, None])
 
                     opt.zero_grad()
                     loss.backward()
-                    for param in policy_net.parameters():
-                        param.grad.data.clamp_(-CLIP_GRAD, CLIP_GRAD)
-                    #print("policy", sum([p.abs().sum().data.numpy() for p in policy_net.parameters()]))
-                    #print("target", sum([p.abs().sum().data.numpy() for p in target_net.parameters()]))
-                    #torch.nn.utils.clip_grad_value_(policy_net.parameters(), CLIP_GRAD)
+                    torch.nn.utils.clip_grad_value_(policy_net.parameters(), CLIP_GRAD)
                     opt.step()
                     epoch_losses[k] += loss.detach().cpu().numpy()
                     epoch_steps[k] += 1.
@@ -309,18 +318,21 @@ for i in range(N_EPOCHS):
         experience = (S, action, won, S, ongoing_flag)
         exp_replay.send(experience)
 
+    stop = time.time()
+    overall_time += stop - start
+
     if TARGET_UPDATE > 0 and i % TARGET_UPDATE == 0:
         print("Updating target network at {}".format(i))
         target_net.load_state_dict(policy_net.state_dict())
 
     if i % PRINT_EVERY == 0:
-        #print("Epoch {}, head {}, loss: {}".format(i + 1, active_head, [epoch_losses[k] / float(epoch_steps[k]) for k in range(N_ENSEMBLE)]))
-        print("Epoch {}, head {}, loss: {}".format(i + 1, active_head, [epoch_losses[k] for k in range(N_ENSEMBLE)]))
+        print("Epoch {}, head {}, loss: {}".format(i + 1, active_head, [epoch_losses[k] / float(epoch_steps[k]) for k in range(N_ENSEMBLE)]))
 
     if i % EVALUATE_EVERY == 0 or i == (N_EPOCHS - 1):
         if i == (N_EPOCHS - 1):
             # save images at the end for sure
             SAVE_IMAGES = True
+            ORIG_N_EVALUATIONS = N_EVALUATIONS
             N_EVALUATIONS = 5
         if SAVE_IMAGES:
             img_saver = save_img(i)
@@ -328,8 +340,8 @@ for i in range(N_EPOCHS):
         ensemble_rewards = []
         for k in range(N_ENSEMBLE):
             avg_rewards = []
+            print("Evaluation of head {}".format(k))
             for _ in range(N_EVALUATIONS):
-                print("Evaluation {}".format(_))
                 g = episode()
                 S, reward = next(g)
                 if SAVE_IMAGES:
@@ -347,6 +359,39 @@ for i in range(N_EPOCHS):
                     # sum should be either -1 or +1
                     avg_rewards.append(np.sum(episode_rewards))
             ensemble_rewards.append(np.mean(avg_rewards))
-        print("rewards", ensemble_rewards)
+        print("Rewards {}".format(ensemble_rewards))
+        accumulated_rewards.append(ensemble_rewards)
         if SAVE_IMAGES:
             img_saver.close()
+
+    if i == (N_EPOCHS - 1):
+        plt.figure()
+        for k in range(N_ENSEMBLE):
+            trace = np.array([ar[k] for ar in accumulated_rewards])
+            xs = np.array([int(n * EVALUATE_EVERY) for n in range(N_EPOCHS // EVALUATE_EVERY + 1)])
+            plt.plot(xs, trace, label="Head {}".format(k))
+        plt.legend()
+        plt.ylabel("Average Evaluation Reward ({})".format(ORIG_N_EVALUATIONS))
+
+        model = "Double DQN" if USE_DOUBLE_DQN else "DQN"
+        if N_ENSEMBLE > 1:
+            model = "Bootstrap " + model
+        if PRIOR_SCALE > 0.:
+            model = model + " with randomized prior {}".format(PRIOR_SCALE)
+        footnote_text = "Episodes\n"
+        footnote_text += "\n"
+        footnote_text += "\n"
+        footnote_text += "Settings:\n"
+        footnote_text += "{}\n".format(model)
+        footnote_text += "Number of heads {}\n".format(N_ENSEMBLE)
+        footnote_text += "Epsilon-greedy {}\n".format(EPSILON)
+        footnote_text += "Gamma decay {}\n".format(GAMMA)
+        footnote_text += "Grad clip {}\n".format(CLIP_GRAD)
+        footnote_text += "Adam, learning rate {}\n".format(ADAM_LEARNING_RATE)
+        footnote_text += "Batch size {}\n".format(BATCH_SIZE)
+        footnote_text += "Experience replay buffer size {}\n".format(BUFFER_SIZE)
+        footnote_text += "Training time {}\n".format(overall_time)
+        plt.xlabel(footnote_text)
+        plt.tight_layout()
+        plt.savefig("reward_traces.png")
+
