@@ -36,7 +36,7 @@ BERNOULLI_P = .5
 # Weight for randomized prior, 0. disables
 PRIOR_SCALE = 1.
 # Number of episodes to run
-N_EPOCHS = 20
+N_EPOCHS = 1000
 # Batch size to use for learning
 BATCH_SIZE = 128
 # Buffer size for experience replay
@@ -169,8 +169,14 @@ class EnsembleNet(nn.Module):
         super(EnsembleNet, self).__init__()
         self.core_net = CoreNet()
         self.net_list = nn.ModuleList([HeadNet() for k in range(n_ensemble)])
-    def forward(self, x):
-        return [net(self.core_net(x)) for net in self.net_list]
+    def _core(self, x):
+        return self.core_net(x)
+
+    def _heads(self, x):
+        return [net(x) for net in self.net_list]
+
+    def forward(self, x, k):
+        return self.net_list[k](self.core_net(x))
 
 
 class NetWithPrior(nn.Module):
@@ -181,38 +187,19 @@ class NetWithPrior(nn.Module):
         if self.prior_scale > 0.:
             self.prior = prior
 
-    def forward(self, x):
+    def forward(self, x, k):
         if hasattr(self.net, "net_list"):
-            if self.prior_scale > 0.:
-                return [self.net(x)[k] + self.prior_scale * self.prior(x)[k].detach() for k in range(len(self.net.net_list))]
+            if k is not None:
+                if self.prior_scale > 0.:
+                    return self.net(x, k) + self.prior_scale * self.prior(x, k).detach()
+                else:
+                    return self.net(x, k)
             else:
-                return [self.net(x)[k] for k in range(len(self.net.net_list))]
-
+                core_cache = self.net._core(x)
+                from IPython import embed; embed(); raise ValueError()
+                return self.net._heads(core_cache)
         else:
-            if self.prior_scale > 0.:
-                return self.net(x) + self.prior_scale * self.prior(x).detach()
-            else:
-                return self.net(x)
-
-
-class Net(nn.Module):
-    def __init__(self):
-        super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(1, 16, 3, 1, padding=(1, 1))
-        self.conv2 = nn.Conv2d(16, 16, 3, 1, padding=(1, 1))
-        #self.conv3 = nn.Conv2d(16, 16, 3, 1, padding=(1, 1))
-        self.fc1 = nn.Linear(10 * 10 * 16, 100)
-        self.fc2 = nn.Linear(100, 3)
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        #x = F.relu(self.conv3(x))
-        x = x.view(-1, 10 * 10 * 16)
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
-        return [x]
-
+            raise ValueError("Only works with a net_list model")
 
 prior_net = EnsembleNet(N_ENSEMBLE)
 policy_net = EnsembleNet(N_ENSEMBLE)
@@ -248,18 +235,20 @@ for i in range(N_EPOCHS):
                 # Get the index of the maximum q-value of the model.
                 # Subtract one because actions are either -1, 0, or 1
                 with torch.no_grad():
-                    action = np.argmax(policy_net(torch.Tensor(S[None]))[active_head].detach().data.numpy(), axis=-1)[0]
+                    action = np.argmax(policy_net(torch.Tensor(S[None]),active_head).detach().data.numpy(), axis=-1)[0]
 
             S_prime, won = ep.send(action)
             ongoing_flag = 1.
             experience = (S, action, won, S_prime, ongoing_flag)
             S = S_prime
-            for k in range(N_ENSEMBLE):
+            k_order = [k for k in range(N_ENSEMBLE)]
+            random_state.shuffle(k_order)
+            for k in k_order:
                 exp_replay = exp_replays[k]
                 # reset batch to default None, since we are looping
                 batch = None
                 # .5 probability of adding to each buffer for bootstrap dqn, see paper for details
-                if random_state.rand() > .5 or N_ENSEMBLE == 1:
+                if random_state.rand() > BERNOULLI_P or N_ENSEMBLE == 1:
                     batch = exp_replay.send(experience)
                 else:
                     continue
@@ -277,13 +266,13 @@ for i in range(N_EPOCHS):
                         ongoing_flags.append(ongoing_flag)
 
                     if TARGET_UPDATE == 0:
-                        next_Qs = policy_net(torch.Tensor(nexts))[k].detach()
+                        next_Qs = policy_net(torch.Tensor(nexts),k).detach()
                     else:
-                        next_Qs = target_net(torch.Tensor(nexts))[k].detach()
+                        next_Qs = target_net(torch.Tensor(nexts),k).detach()
 
                     if USE_DOUBLE_DQN:
                         # double Q
-                        policy_next_Qs = policy_net(torch.Tensor(nexts))[k].detach()
+                        policy_next_Qs = policy_net(torch.Tensor(nexts), k).detach()
                         policy_actions = policy_next_Qs.max(1)[1][:, None]
                         next_max_Qs = next_Qs.gather(1, policy_actions)
                         next_max_Qs = next_max_Qs.squeeze()
@@ -297,7 +286,7 @@ for i in range(N_EPOCHS):
                     target_Qs = torch.Tensor(np.array(rewards).astype("float32")) + GAMMA * next_max_Qs
 
                     # get current step predictions
-                    Qs = policy_net(torch.Tensor(inputs))[k]
+                    Qs = policy_net(torch.Tensor(inputs), k)
                     Qs = Qs.gather(1, torch.LongTensor(np.array(actions)[:, None].astype("int32")))
                     Qs = Qs.squeeze()
 
@@ -350,7 +339,7 @@ for i in range(N_EPOCHS):
                 try:
                     policy_net.eval()
                     while True:
-                        act = np.argmax(policy_net(torch.Tensor(S[None]))[k].data.numpy(), axis=-1)[0]
+                        act = np.argmax(policy_net(torch.Tensor(S[None]), k).data.numpy(), axis=-1)[0]
                         S, reward = g.send(act)
                         episode_rewards.append(reward)
                         if SAVE_IMAGES:
